@@ -1,6 +1,4 @@
 from __future__ import annotations
-import os
-port = int(os.environ.get("PORT", 8501))
 
 import re
 import pandas as pd
@@ -20,9 +18,6 @@ from src.matching import build_detail_dataset, build_match_check
 from src.metrics import build_alerts, build_analysis_text, build_daily_dataset, build_daily_detail_dataset, build_sku_tables, build_tag_snapshot, safe_divide
 from src.ui_helpers import build_export_file, format_pct, pick_existing_columns, style_daily_detail_table
 
-st.set_page_config(page_title="营销数据看板", layout="wide")
-st.set_option('server.port', port)
-st.set_option('server.address', '0.0.0.0')
 st.set_page_config(page_title="营销数据看板", layout="wide")
 st.title("营销数据看板")
 
