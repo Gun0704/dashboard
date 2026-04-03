@@ -1,3 +1,8 @@
+import os
+port = int(os.environ.get("PORT", 8501))
+st.set_page_config(page_title="营销数据看板", layout="wide")
+st.set_option('server.port', port)
+st.set_option('server.address', '0.0.0.0')
 from __future__ import annotations
 
 import re
