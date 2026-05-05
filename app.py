@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import re
+
 import pandas as pd
 import streamlit as st
 
-from src.charts import make_dual_axis_trend_chart, make_orders_ctr_chart, make_sales_units_chart
+from src.charts import make_clicks_conversion_chart, make_frontend_price_sales_chart, make_impressions_ctr_chart
 from src.cleaners import (
     clean_mapping_df,
     clean_sales_df,
@@ -12,6 +13,7 @@ from src.cleaners import (
     is_sales_file,
     is_traffic_file,
     read_uploaded_table,
+    parse_numeric_series,
 )
 from src.config import DEFAULT_CONVERSION_BASIS, DEFAULT_INDUSTRY_CONVERSION, DEFAULT_INDUSTRY_CTR, QUICK_TAG_OPTIONS
 from src.matching import build_detail_dataset, build_match_check
@@ -24,10 +26,18 @@ st.title("营销数据看板")
 @st.cache_data(show_spinner=False)
 def load_uploaded_table(file_name: str, file_bytes: bytes) -> pd.DataFrame:
     from io import BytesIO
+
     suffix = file_name.lower().split(".")[-1]
     bio = BytesIO(file_bytes)
     if suffix == "csv":
-        return pd.read_csv(bio)
+        last_error = None
+        for encoding in ("utf-8", "utf-8-sig", "latin1", "cp1252"):
+            try:
+                bio.seek(0)
+                return pd.read_csv(bio, encoding=encoding)
+            except Exception as exc:
+                last_error = exc
+        raise ValueError(f"CSV 读取失败：{last_error}")
     return pd.read_excel(bio)
 
 
@@ -90,10 +100,144 @@ def compute_base_datasets(
     mapping_df: pd.DataFrame,
     conversion_basis: str,
 ) -> tuple[pd.DataFrame, dict, dict]:
-    detail_df, match_summary, match_details = compute_base_datasets(sales_df, traffic_df, mapping_df, conversion_basis)
+    detail_df = build_detail_dataset(sales_df, traffic_df, mapping_df, conversion_basis)
+    match_summary, match_details = build_match_check(sales_df, traffic_df, mapping_df)
     return detail_df, match_summary, match_details
 
 
+@st.cache_data(show_spinner=False)
+def load_frontend_order_df(file_name: str, file_bytes: bytes) -> pd.DataFrame:
+    df = load_uploaded_table(file_name, file_bytes)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    required_cols = ["purchase date", "retail price (tax excl.)", "quantity purchased"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"前端价订单表缺少字段：{', '.join(missing)}")
+
+    cleaned = df.copy()
+    purchase_text = (
+        cleaned["purchase date"].astype(str).str.strip()
+        .str.replace(r"\s+[A-Z]{2,5}\(UTC[+-]\d+\)$", "", regex=True)
+        .str.replace(r"\s+UTC[+-]?\d+$", "", regex=True)
+    )
+    purchase_dt = pd.to_datetime(purchase_text, errors="coerce")
+    if purchase_dt.isna().any():
+        fallback_dt = pd.to_datetime(purchase_text, format="%b %d, %Y, %I:%M %p", errors="coerce")
+        purchase_dt = purchase_dt.fillna(fallback_dt)
+    cleaned["purchase_dt"] = purchase_dt
+    cleaned["date"] = cleaned["purchase_dt"].dt.normalize()
+    cleaned["retail price (tax excl.)"] = parse_numeric_series(cleaned["retail price (tax excl.)"])
+    cleaned["quantity purchased"] = parse_numeric_series(cleaned["quantity purchased"])
+
+    for status_col in ["order status", "order item status"]:
+        if status_col in cleaned.columns:
+            cleaned[status_col] = cleaned[status_col].astype(str).str.strip()
+    if "contribution sku" in cleaned.columns:
+        cleaned["contribution sku"] = cleaned["contribution sku"].astype(str).str.strip()
+        cleaned["contribution sku"] = cleaned["contribution sku"].replace({"nan": "", "None": ""})
+
+    invalid_status_mask = pd.Series(False, index=cleaned.index)
+    for status_col in ["order status", "order item status"]:
+        if status_col in cleaned.columns:
+            invalid_status_mask = invalid_status_mask | cleaned[status_col].str.contains(
+                r"cancel|closed|void", case=False, na=False
+            )
+
+    cleaned = cleaned.dropna(subset=["date"]).copy()
+    cleaned = cleaned[cleaned["retail price (tax excl.)"] > 0].copy()
+    cleaned = cleaned[cleaned["quantity purchased"] > 0].copy()
+    cleaned = cleaned[~invalid_status_mask.loc[cleaned.index]].copy()
+
+    if cleaned.empty:
+        raise ValueError("前端价订单表清洗后无有效数据")
+    return cleaned
+
+
+@st.cache_data(show_spinner=False)
+def build_frontend_daily_dataset(order_df: pd.DataFrame) -> pd.DataFrame:
+    def _agg(group: pd.DataFrame) -> pd.Series:
+        total_qty = pd.to_numeric(group["quantity purchased"], errors="coerce").fillna(0).sum()
+        total_retail = pd.to_numeric(group["retail price (tax excl.)"], errors="coerce").fillna(0).sum()
+        unit_price_tax_excl = total_retail / total_qty if total_qty else 0
+        return pd.Series({
+            "frontend_price": unit_price_tax_excl * 1.16,
+            "frontend_price_tax_excl": unit_price_tax_excl,
+            "quantity_purchased": total_qty,
+            "retail_price_tax_excl_total": total_retail,
+        })
+
+    daily = order_df.groupby("date").apply(_agg).reset_index()
+    return daily.sort_values("date")
+
+
+def normalize_text_key(series: pd.Series | None) -> pd.Series:
+    if series is None:
+        return pd.Series(dtype=str)
+    return (
+        series.astype(str)
+        .str.strip()
+        .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "<NA>": pd.NA})
+        .fillna("")
+    )
+
+
+@st.cache_data(show_spinner=False)
+def enrich_frontend_order_df(
+    frontend_order_df: pd.DataFrame,
+    sales_df: pd.DataFrame,
+    traffic_df: pd.DataFrame,
+    mapping_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict]:
+    if frontend_order_df.empty:
+        return frontend_order_df.copy(), {"total_rows": 0, "mapped_rows": 0, "mapped_ratio": 0.0, "sku_hit_rows": 0, "name_hit_rows": 0}
+
+    enriched = frontend_order_df.copy()
+    enriched["product_name_key"] = normalize_text_key(enriched.get("product name"))
+    enriched["frontend_sku"] = normalize_text_key(enriched.get("contribution sku"))
+    enriched["variation_key"] = normalize_text_key(enriched.get("variation"))
+
+    name_parts: list[pd.DataFrame] = []
+    if not sales_df.empty and {"product_name", "goods_id"}.issubset(sales_df.columns):
+        name_parts.append(sales_df[["product_name", "goods_id"]].copy())
+    if not traffic_df.empty and {"product_name", "goods_id"}.issubset(traffic_df.columns):
+        name_parts.append(traffic_df[["product_name", "goods_id"]].copy())
+    if not mapping_df.empty and {"product_name", "goods_id"}.issubset(mapping_df.columns):
+        name_parts.append(mapping_df[["product_name", "goods_id"]].copy())
+
+    if name_parts:
+        name_map = pd.concat(name_parts, ignore_index=True)
+        name_map["product_name"] = normalize_text_key(name_map["product_name"])
+        name_map["goods_id"] = normalize_text_key(name_map["goods_id"])
+        name_map = name_map[(name_map["product_name"] != "") & (name_map["goods_id"] != "")].drop_duplicates()
+        name_map = name_map.drop_duplicates(subset=["product_name"], keep="first")
+        enriched = enriched.merge(name_map.rename(columns={"product_name": "product_name_key", "goods_id": "goods_id_by_name"}), on="product_name_key", how="left")
+    else:
+        enriched["goods_id_by_name"] = ""
+
+    if not mapping_df.empty and {"sku", "goods_id"}.issubset(mapping_df.columns):
+        sku_map = mapping_df[["sku", "goods_id"]].copy()
+        sku_map["sku"] = normalize_text_key(sku_map["sku"])
+        sku_map["goods_id"] = normalize_text_key(sku_map["goods_id"])
+        sku_map = sku_map[(sku_map["sku"] != "") & (sku_map["goods_id"] != "")].drop_duplicates()
+        sku_map = sku_map.drop_duplicates(subset=["sku"], keep="first")
+        enriched = enriched.merge(sku_map.rename(columns={"sku": "frontend_sku", "goods_id": "goods_id_by_sku"}), on="frontend_sku", how="left")
+    else:
+        enriched["goods_id_by_sku"] = ""
+
+    enriched["goods_id"] = normalize_text_key(enriched.get("goods_id_by_sku")).where(
+        normalize_text_key(enriched.get("goods_id_by_sku")) != "",
+        normalize_text_key(enriched.get("goods_id_by_name")),
+    )
+    enriched["display_sku"] = enriched["frontend_sku"].where(enriched["frontend_sku"] != "", enriched["goods_id"])
+
+    stats = {
+        "total_rows": int(len(enriched)),
+        "mapped_rows": int((enriched["goods_id"] != "").sum()),
+        "mapped_ratio": float((enriched["goods_id"] != "").mean()) if len(enriched) else 0.0,
+        "sku_hit_rows": int((normalize_text_key(enriched.get("goods_id_by_sku")) != "").sum()),
+        "name_hit_rows": int((normalize_text_key(enriched.get("goods_id_by_name")) != "").sum()),
+    }
+    return enriched, stats
 
 def extract_goods_ids(raw_text: str) -> list[str]:
     if not raw_text:
@@ -201,6 +345,7 @@ with st.sidebar:
     sales_files = st.file_uploader("批量上传销售表", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
     traffic_files = st.file_uploader("批量上传流量表", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
     mapping_files = st.file_uploader("批量上传商品信息表 / SKU映射表", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
+    frontend_order_file = st.file_uploader("上传前端价订单导出表", type=["csv", "xlsx", "xls"], accept_multiple_files=False)
     all_data_files = st.file_uploader("或一次性混合上传（自动识别销售/流量）", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
     conversion_basis = st.selectbox("订单口径", ["订单商品数", "买家数", "下单件数"], index=["订单商品数", "买家数", "下单件数"].index(DEFAULT_CONVERSION_BASIS))
     industry_ctr = st.slider("CTR参考值", min_value=0.0, max_value=0.30, value=DEFAULT_INDUSTRY_CTR, step=0.005, format="%.3f")
@@ -222,6 +367,7 @@ sales_inputs = _collect_inputs(sales_files)
 traffic_inputs = _collect_inputs(traffic_files)
 mapping_inputs = _collect_inputs(mapping_files)
 mixed_inputs = _collect_inputs(all_data_files)
+frontend_order_input = (frontend_order_file.name, frontend_order_file.getvalue()) if frontend_order_file else None
 
 try:
     sales_df, traffic_df, mapping_df, messages, unknown_files = process_inputs(
@@ -236,9 +382,20 @@ except Exception as exc:
 for msg in messages:
     st.success(msg)
 
+frontend_order_df = pd.DataFrame()
+frontend_match_stats = {"total_rows": 0, "mapped_rows": 0, "mapped_ratio": 0.0, "sku_hit_rows": 0, "name_hit_rows": 0}
+if frontend_order_input:
+    try:
+        frontend_order_df = load_frontend_order_df(frontend_order_input[0], frontend_order_input[1])
+        frontend_order_df, frontend_match_stats = enrich_frontend_order_df(frontend_order_df, sales_df, traffic_df, mapping_df)
+        st.success(f"前端价订单表载入成功（支持 CSV / Excel），清洗后共 {len(frontend_order_df):,} 行")
+        st.caption(f"前端订单映射成功率：{frontend_match_stats['mapped_ratio']:.1%}（SKU直连 {frontend_match_stats['sku_hit_rows']:,} 行，商品名映射 {frontend_match_stats['name_hit_rows']:,} 行）")
+    except Exception as exc:
+        st.warning(f"前端价订单表读取失败，本次将不展示前端价格销量走势图：{exc}")
+        frontend_order_df = pd.DataFrame()
+
 try:
-    detail_df = build_detail_dataset(sales_df, traffic_df, mapping_df, conversion_basis)
-    match_summary, match_details = build_match_check(sales_df, traffic_df, mapping_df)
+    detail_df, match_summary, match_details = compute_base_datasets(sales_df, traffic_df, mapping_df, conversion_basis)
 except Exception as exc:
     st.error(f"数据合并失败：{exc}")
     st.stop()
@@ -253,16 +410,15 @@ default_start = max(min_date, (detail_df["date"].max() - pd.Timedelta(days=6)).d
 
 st.markdown("## 模块 1：筛选与核心指标区")
 with st.container(border=True):
-    filter_col1, filter_col2, filter_col3, filter_col4, filter_col5 = st.columns([1.15, 1.1, 1.45, 1.0, 1.1])
+    filter_col1, filter_col2, filter_col3, filter_col4, filter_col5 = st.columns([1.15, 1.05, 1.8, 1.0, 1.1])
     with filter_col1:
         valid_stores = sorted({s for s in detail_df["store"].dropna().astype(str).tolist() if s.strip() and s.strip().casefold() not in {"0", "0.0", "nan", "none", "null", "<na>", "未分类店铺"}})
         store_options = ["全部店铺"] + valid_stores
         selected_store = st.selectbox("店铺", store_options, index=0)
     with filter_col2:
-        product_mode = st.selectbox("产品筛选", ["全部产品", "单个产品"], index=0)
+        product_mode = st.selectbox("产品筛选", ["全部产品", "按 Goods ID", "按 SKU"], index=0)
     with filter_col3:
         base_df = detail_df if selected_store == "全部店铺" else detail_df[detail_df["store"] == selected_store]
-        product_options = sorted(base_df["display_sku"].dropna().astype(str).unique().tolist())
         product_tag_df = build_tag_snapshot(base_df) if not base_df.empty else pd.DataFrame()
         tag_priority = {"大爆款": 1, "爆款": 2, "旺款": 3, "上升趋势品": 4, "新品": 5, "常规款": 6, "滞制品": 7}
 
@@ -287,20 +443,72 @@ with st.container(border=True):
                 candidates.append("滞制品")
             return sorted(set(candidates), key=lambda x: tag_priority.get(x, 99))[0] if candidates else raw.replace("↑", "").strip() or "未分类"
 
-        product_label_map = {key: key for key in product_options}
-        if not product_tag_df.empty:
-            product_tag_df = product_tag_df.copy()
-            product_tag_df["main_tag"] = product_tag_df["tag_short"].apply(_pick_main_tag)
-            tag_map = product_tag_df.drop_duplicates("display_sku").set_index("display_sku")["main_tag"].to_dict()
-            product_label_map = {key: f"{key} ｜ {tag_map.get(key, '未分类')}" for key in product_options}
+        goods_id_options = sorted(base_df["goods_id"].dropna().astype(str).loc[lambda s: s.str.strip() != ""].unique().tolist())
+        frontend_sku_goods_df = pd.DataFrame(columns=["display_sku", "goods_id"])
+        if not frontend_order_df.empty and {"display_sku", "goods_id"}.issubset(frontend_order_df.columns):
+            frontend_sku_goods_df = frontend_order_df[["display_sku", "goods_id"]].copy()
+            frontend_sku_goods_df["display_sku"] = frontend_sku_goods_df["display_sku"].astype(str).str.strip()
+            frontend_sku_goods_df["goods_id"] = frontend_sku_goods_df["goods_id"].astype(str).str.strip()
+            frontend_sku_goods_df = frontend_sku_goods_df[(frontend_sku_goods_df["display_sku"] != "") & (frontend_sku_goods_df["goods_id"] != "")]
+            if selected_store != "全部店铺":
+                base_goods_ids = set(base_df["goods_id"].astype(str).unique().tolist())
+                frontend_sku_goods_df = frontend_sku_goods_df[frontend_sku_goods_df["goods_id"].isin(base_goods_ids)]
+            frontend_sku_goods_df = frontend_sku_goods_df.drop_duplicates()
 
-        selected_product = st.selectbox(
-            "选择 SKU / Goods ID",
-            ["全部产品"] + product_options,
-            index=0,
-            disabled=(product_mode == "全部产品"),
-            format_func=lambda x: x if x == "全部产品" else product_label_map.get(x, x),
-        )
+        fallback_sku_goods_df = base_df[["display_sku", "goods_id"]].copy()
+        fallback_sku_goods_df["display_sku"] = fallback_sku_goods_df["display_sku"].astype(str).str.strip()
+        fallback_sku_goods_df["goods_id"] = fallback_sku_goods_df["goods_id"].astype(str).str.strip()
+        fallback_sku_goods_df = fallback_sku_goods_df[(fallback_sku_goods_df["display_sku"] != "") & (fallback_sku_goods_df["goods_id"] != "")].drop_duplicates()
+
+        sku_goods_df = frontend_sku_goods_df if not frontend_sku_goods_df.empty else fallback_sku_goods_df
+        sku_options_all = sorted(sku_goods_df["display_sku"].astype(str).unique().tolist()) if not sku_goods_df.empty else []
+
+        product_tag_df = product_tag_df.copy() if not product_tag_df.empty else pd.DataFrame()
+        if not product_tag_df.empty:
+            product_tag_df["main_tag"] = product_tag_df["tag_short"].apply(_pick_main_tag)
+        goods_tag_map = product_tag_df.drop_duplicates("goods_id").set_index("goods_id")["main_tag"].to_dict() if not product_tag_df.empty else {}
+        sku_goods_map = sku_goods_df.drop_duplicates(subset=["display_sku"], keep="first").set_index("display_sku")["goods_id"].to_dict() if not sku_goods_df.empty else {}
+
+        if product_mode == "按 Goods ID":
+            goods_id_label_map = {key: f"{key} ｜ {goods_tag_map.get(key, '未分类')}" for key in goods_id_options}
+            selected_goods_id = st.selectbox(
+                "选择 Goods ID",
+                ["全部Goods ID"] + goods_id_options,
+                index=0,
+                format_func=lambda x: x if x == "全部Goods ID" else goods_id_label_map.get(x, x),
+            )
+            selected_sku = "全部SKU"
+        elif product_mode == "按 SKU":
+            sub_col1, sub_col2 = st.columns(2)
+            goods_id_label_map = {key: f"{key} ｜ {goods_tag_map.get(key, '未分类')}" for key in goods_id_options}
+            with sub_col1:
+                selected_goods_id = st.selectbox(
+                    "联动 Goods ID（可选）",
+                    ["全部Goods ID"] + goods_id_options,
+                    index=0,
+                    format_func=lambda x: x if x == "全部Goods ID" else goods_id_label_map.get(x, x),
+                )
+            if selected_goods_id != "全部Goods ID" and not sku_goods_df.empty:
+                linked_sku_options = sorted(
+                    sku_goods_df.loc[sku_goods_df["goods_id"] == str(selected_goods_id), "display_sku"].astype(str).unique().tolist()
+                )
+            else:
+                linked_sku_options = sku_options_all
+            sku_label_map = {
+                key: f"{key} ｜ {goods_tag_map.get(sku_goods_map.get(key, ''), '未分类')} ｜ Goods {sku_goods_map.get(key, '-') }"
+                for key in linked_sku_options
+            }
+            with sub_col2:
+                selected_sku = st.selectbox(
+                    "选择 SKU",
+                    ["全部SKU"] + linked_sku_options,
+                    index=0,
+                    format_func=lambda x: x if x == "全部SKU" else sku_label_map.get(x, x),
+                )
+        else:
+            st.selectbox("选择 Goods ID / SKU", ["全部产品"], index=0, disabled=True)
+            selected_goods_id = "全部Goods ID"
+            selected_sku = "全部SKU"
     with filter_col4:
         selected_dates = st.date_input("日期范围", value=(default_start, max_date), min_value=min_date, max_value=max_date)
     quick_tag_options = ["全部标签", "核心爆款", "上升趋势品", "滞制品", "大爆款", "爆款", "旺款", "常规款", "新品"]
@@ -331,7 +539,7 @@ with st.container(border=True):
         st.button("清空输入", use_container_width=True, on_click=clear_goods_id_bulk_input)
         st.button("粘贴示例", use_container_width=True, on_click=fill_goods_id_bulk_example)
     with extra_col3:
-        st.caption("产品下拉显示 SKU / Goods ID，并附带主标签（如爆款、旺款、新品）；不使用 Product name / Goods Name。")
+        st.caption("单品筛选支持按 Goods ID 或按 SKU 两种模式。SKU 模式新增 Goods ID 联动下拉：可先选 Goods ID，再只看该 Goods 下的 SKU；价格销量走势图按真实 SKU 过滤。")
 
 raw_goods_ids = extract_goods_ids(goods_id_input)
 
@@ -343,8 +551,33 @@ else:
 filtered_df = detail_df[(detail_df["date"].dt.date >= start_date) & (detail_df["date"].dt.date <= end_date)].copy()
 if selected_store != "全部店铺":
     filtered_df = filtered_df[filtered_df["store"] == selected_store]
-if product_mode == "单个产品" and selected_product != "全部产品":
-    filtered_df = filtered_df[filtered_df["display_sku"] == selected_product]
+selected_product = "全部产品"
+if product_mode == "按 Goods ID":
+    selected_product = selected_goods_id
+    if selected_goods_id != "全部Goods ID":
+        filtered_df = filtered_df[filtered_df["goods_id"].astype(str) == str(selected_goods_id)]
+elif product_mode == "按 SKU":
+    selected_product = selected_sku
+    selected_goods_ids: list[str] = []
+    if selected_goods_id != "全部Goods ID":
+        selected_goods_ids = [str(selected_goods_id)]
+        filtered_df = filtered_df[filtered_df["goods_id"].astype(str) == str(selected_goods_id)]
+    elif not frontend_order_df.empty and {"display_sku", "goods_id"}.issubset(frontend_order_df.columns) and selected_sku != "全部SKU":
+        selected_goods_ids = frontend_order_df.loc[
+            frontend_order_df["display_sku"].astype(str) == str(selected_sku),
+            "goods_id",
+        ].astype(str).dropna().unique().tolist()
+        if selected_goods_ids:
+            filtered_df = filtered_df[filtered_df["goods_id"].astype(str).isin(selected_goods_ids)]
+        else:
+            filtered_df = filtered_df.iloc[0:0].copy()
+    if selected_sku != "全部SKU":
+        if selected_goods_ids:
+            sku_filtered_df = filtered_df[filtered_df["display_sku"].astype(str) == str(selected_sku)]
+            if not sku_filtered_df.empty:
+                filtered_df = sku_filtered_df
+        elif frontend_order_df.empty:
+            filtered_df = filtered_df[filtered_df["display_sku"].astype(str) == str(selected_sku)]
 
 match_scope_df = filtered_df.copy()
 available_goods_ids = set(match_scope_df["goods_id"].astype(str).dropna().tolist())
@@ -378,11 +611,33 @@ if filtered_df.empty:
     st.warning("当前筛选条件下没有数据。")
     st.stop()
 
+frontend_filtered_df = pd.DataFrame()
+frontend_scope_text = "全部商品"
+if not frontend_order_df.empty:
+    frontend_filtered_df = frontend_order_df[(frontend_order_df["date"].dt.date >= start_date) & (frontend_order_df["date"].dt.date <= end_date)].copy()
+    if selected_store != "全部店铺" and "goods_id" in frontend_filtered_df.columns:
+        scoped_goods_ids = set(filtered_df["goods_id"].astype(str).unique().tolist())
+        frontend_filtered_df = frontend_filtered_df[frontend_filtered_df["goods_id"].astype(str).isin(scoped_goods_ids)]
+    if product_mode == "按 Goods ID" and selected_goods_id != "全部Goods ID":
+        frontend_scope_text = f"Goods ID：{selected_goods_id}"
+        frontend_filtered_df = frontend_filtered_df[frontend_filtered_df["goods_id"].astype(str) == str(selected_goods_id)]
+    elif product_mode == "按 SKU":
+        if selected_goods_id != "全部Goods ID":
+            frontend_filtered_df = frontend_filtered_df[frontend_filtered_df["goods_id"].astype(str) == str(selected_goods_id)]
+            frontend_scope_text = f"Goods ID：{selected_goods_id}"
+        if selected_sku != "全部SKU":
+            frontend_filtered_df = frontend_filtered_df[frontend_filtered_df["display_sku"].astype(str) == str(selected_sku)]
+            frontend_scope_text = f"{frontend_scope_text} / SKU：{selected_sku}" if frontend_scope_text != "全部商品" else f"SKU：{selected_sku}"
+
 daily_df = build_daily_dataset(filtered_df)
 daily_detail_df = build_daily_detail_dataset(filtered_df)
 tag_snapshot = build_tag_snapshot(filtered_df)
 top20, abnormal_sku, unmatched_sku = build_sku_tables(filtered_df)
 today_alerts, history_alerts, tag_alerts, actions = build_alerts(filtered_df, tag_snapshot, daily_df)
+
+is_single_goods_selected = product_mode == "按 Goods ID" and selected_goods_id != "全部Goods ID"
+is_single_sku_selected = product_mode == "按 SKU" and selected_sku != "全部SKU"
+show_frontend_chart = is_single_goods_selected or is_single_sku_selected
 
 summary_impressions = filtered_df["impressions"].sum()
 summary_clicks = filtered_df["clicks"].sum()
@@ -469,13 +724,24 @@ with metric_row3[1]:
 
 st.markdown("## 模块 2：每日趋势可视化区")
 with st.container(border=True):
-    chart1, chart2, chart3 = st.columns(3)
+    chart1, chart2 = st.columns(2)
     with chart1:
-        st.plotly_chart(make_dual_axis_trend_chart(daily_df), use_container_width=True)
+        st.plotly_chart(make_impressions_ctr_chart(daily_df, ctr_target=industry_ctr), use_container_width=True)
     with chart2:
-        st.plotly_chart(make_orders_ctr_chart(daily_df, ctr_target=industry_ctr), use_container_width=True)
-    with chart3:
-        st.plotly_chart(make_sales_units_chart(daily_df), use_container_width=True)
+        st.plotly_chart(make_clicks_conversion_chart(daily_df, conversion_target=industry_conversion), use_container_width=True)
+
+    if show_frontend_chart:
+        if not frontend_filtered_df.empty:
+            frontend_daily_df = build_frontend_daily_dataset(frontend_filtered_df)
+            if not frontend_daily_df.empty:
+                st.plotly_chart(make_frontend_price_sales_chart(frontend_daily_df), use_container_width=True)
+                st.caption(f"价格销量走势图口径：{frontend_scope_text}。仅在选中单个 Goods ID 或单个 SKU 后显示。前端价 = 当日 Retail price (tax excl.) 总和 ÷ 当日 quantity purchased 总和 × 1.16；销量 = 当日 quantity purchased 汇总。")
+            else:
+                st.info("当前单品条件下没有可展示的前端订单数据。")
+        else:
+            st.info("当前单品条件下没有可展示的前端订单数据。")
+    else:
+        st.info("请选择单个 Goods ID 或单个 SKU 后，再查看前端价格与销量走势图。")
 
 st.markdown("## 模块 3：每日数据明细区")
 with st.container(border=True):
