@@ -18,6 +18,7 @@ from src.cleaners import (
 from src.config import DEFAULT_CONVERSION_BASIS, DEFAULT_INDUSTRY_CONVERSION, DEFAULT_INDUSTRY_CTR, QUICK_TAG_OPTIONS
 from src.matching import build_detail_dataset, build_match_check
 from src.metrics import build_alerts, build_analysis_text, build_daily_dataset, build_daily_detail_dataset, build_sku_tables, build_tag_snapshot, safe_divide
+from src.returns import build_return_export_file, build_return_summary, clean_return_df, filter_return_df, format_return_display_df
 from src.ui_helpers import build_export_file, format_pct, pick_existing_columns, style_daily_detail_table
 
 st.set_page_config(page_title="营销数据看板", layout="wide")
@@ -346,6 +347,7 @@ with st.sidebar:
     traffic_files = st.file_uploader("批量上传流量表", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
     mapping_files = st.file_uploader("批量上传商品信息表 / SKU映射表", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
     frontend_order_file = st.file_uploader("上传前端价订单导出表", type=["csv", "xlsx", "xls"], accept_multiple_files=False)
+    return_files = st.file_uploader("上传售后退货报表 / Return report", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
     all_data_files = st.file_uploader("或一次性混合上传（自动识别销售/流量）", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
     conversion_basis = st.selectbox("订单口径", ["订单商品数", "买家数", "下单件数"], index=["订单商品数", "买家数", "下单件数"].index(DEFAULT_CONVERSION_BASIS))
     industry_ctr = st.slider("CTR参考值", min_value=0.0, max_value=0.30, value=DEFAULT_INDUSTRY_CTR, step=0.005, format="%.3f")
@@ -355,6 +357,7 @@ with st.sidebar:
     st.write("- 支持多店铺、多日期批量上传")
     st.write("- 自动按字段识别销售表和流量表")
     st.write("- Goods ID 统一匹配，SKU 优先展示，未匹配回退 Goods ID")
+    st.write("- 售后退货报表支持店铺 / SKU ID / 状态 / 原因 / 日期筛选，并可导出 Excel")
 
 if not sales_files and not traffic_files and not all_data_files:
     st.info("请先上传销售表和流量表；商品信息表可选但建议上传。")
@@ -368,6 +371,7 @@ traffic_inputs = _collect_inputs(traffic_files)
 mapping_inputs = _collect_inputs(mapping_files)
 mixed_inputs = _collect_inputs(all_data_files)
 frontend_order_input = (frontend_order_file.name, frontend_order_file.getvalue()) if frontend_order_file else None
+return_inputs = _collect_inputs(return_files)
 
 try:
     sales_df, traffic_df, mapping_df, messages, unknown_files = process_inputs(
@@ -384,6 +388,16 @@ for msg in messages:
 
 frontend_order_df = pd.DataFrame()
 frontend_match_stats = {"total_rows": 0, "mapped_rows": 0, "mapped_ratio": 0.0, "sku_hit_rows": 0, "name_hit_rows": 0}
+return_df = pd.DataFrame()
+if return_inputs:
+    try:
+        return_parts = [clean_return_df(load_uploaded_table(name, content), name) for name, content in return_inputs]
+        return_df = pd.concat(return_parts, ignore_index=True) if return_parts else pd.DataFrame()
+        st.success(f"售后退货报表载入成功，共 {len(return_inputs)} 个文件、{len(return_df):,} 行")
+    except Exception as exc:
+        st.warning(f"售后退货报表读取失败，本次将不展示模块 6：{exc}")
+        return_df = pd.DataFrame()
+
 if frontend_order_input:
     try:
         frontend_order_df = load_frontend_order_df(frontend_order_input[0], frontend_order_input[1])
@@ -407,6 +421,24 @@ if detail_df.empty:
 min_date = detail_df["date"].min().date()
 max_date = detail_df["date"].max().date()
 default_start = max(min_date, (detail_df["date"].max() - pd.Timedelta(days=6)).date())
+
+# 售后报表通常没有店铺字段，店铺筛选默认来自报表字段或文件名；
+# 如果平台导出的文件名只是 return_report，可在侧边栏手动归入某个项目店铺。
+valid_return_assignment_stores = sorted({
+    str(x).strip() for x in detail_df.get("store", pd.Series(dtype="object")).dropna().astype(str).tolist()
+    if str(x).strip() and str(x).strip().casefold() not in {"0", "0.0", "nan", "none", "null", "<na>", "未分类店铺"}
+})
+if not return_df.empty:
+    with st.sidebar:
+        return_store_assignment = st.selectbox(
+            "售后报表店铺归属",
+            ["按报表字段/文件名自动识别"] + [f"全部归入：{store}" for store in valid_return_assignment_stores],
+            index=0,
+            help="Return report 如果没有店铺列，系统只能从文件名推断；文件名为 return_report 时会显示为未识别店铺。这里可手动把本次售后报表归入指定店铺。",
+        )
+    if return_store_assignment.startswith("全部归入："):
+        return_df = return_df.copy()
+        return_df["store"] = return_store_assignment.split("：", 1)[1]
 
 st.markdown("## 模块 1：筛选与核心指标区")
 with st.container(border=True):
@@ -863,6 +895,107 @@ with st.container(border=True):
                 st.write(f"- {item}")
         else:
             st.write("当前无需额外动作建议。")
+
+
+st.markdown("## 模块 6：产品售后监控 - SKU退货退款统计")
+with st.container(border=True):
+    if return_df.empty:
+        st.info("上传售后退货报表后，可按店铺、SKU ID、售后单状态、申请理由、申请日期范围和一级原因筛选，并导出当前筛选结果。")
+    else:
+        return_min_dt = return_df["requested_date"].dropna().min()
+        return_max_dt = return_df["requested_date"].dropna().max()
+        if pd.isna(return_min_dt) or pd.isna(return_max_dt):
+            return_min_date, return_max_date = min_date, max_date
+        else:
+            return_min_date, return_max_date = return_min_dt.date(), return_max_dt.date()
+
+        r_filter1, r_filter2, r_filter3 = st.columns([1.0, 1.4, 1.6])
+        with r_filter1:
+            return_store_options = ["全部店铺"] + sorted({s for s in return_df["store"].dropna().astype(str).tolist() if s.strip() and s.strip().casefold() not in {"nan", "none", "null", "<na>"}})
+            return_selected_store = st.selectbox("售后店铺", return_store_options, index=0)
+        with r_filter2:
+            return_date_range = st.date_input("申请日期范围", value=(return_min_date, return_max_date), min_value=return_min_date, max_value=return_max_date, key="return_date_range")
+        with r_filter3:
+            return_search_text = st.text_input("精确查询", placeholder="输入订单ID / 售后单ID / SKU ID / 运单号 / 申请理由关键词")
+
+        if isinstance(return_date_range, tuple) and len(return_date_range) == 2:
+            return_start_date, return_end_date = return_date_range
+        else:
+            return_start_date, return_end_date = return_min_date, return_max_date
+
+        scoped_return_for_options = filter_return_df(return_df, store=return_selected_store, start_date=return_start_date, end_date=return_end_date)
+        r_filter4, r_filter5, r_filter6, r_filter7 = st.columns([1.3, 1.15, 1.6, 1.2])
+        with r_filter4:
+            sku_id_options = sorted(scoped_return_for_options["sku_id"].dropna().astype(str).unique().tolist())
+            selected_return_skus = st.multiselect("SKU ID", sku_id_options, default=[])
+        with r_filter5:
+            selected_return_statuses = st.multiselect("售后单状态", ["尚未退款", "已退款", "已拒绝"], default=[])
+        with r_filter6:
+            reason_options = sorted(scoped_return_for_options["reason_for_request"].dropna().astype(str).loc[lambda x: x.str.strip() != ""].unique().tolist())
+            selected_return_reasons = st.multiselect("申请理由", reason_options, default=[])
+        with r_filter7:
+            selected_first_reasons = st.multiselect("一级原因", ["配送问题", "客户问题", "发货问题", "产品问题", "配送和产品问题", "其他"], default=[])
+
+        return_filtered_df = filter_return_df(
+            return_df,
+            store=return_selected_store,
+            sku_ids=selected_return_skus,
+            statuses=selected_return_statuses,
+            reasons=selected_return_reasons,
+            first_reasons=selected_first_reasons,
+            start_date=return_start_date,
+            end_date=return_end_date,
+            search_text=return_search_text,
+        )
+        return_summary = build_return_summary(return_filtered_df, detail_df, start_date=return_start_date, end_date=return_end_date, store=return_selected_store)
+
+        kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+        kpi1.metric("退款金额", f"MX${return_summary['refund_amount']:,.2f}")
+        kpi2.metric("退货退款订单数", f"{return_summary['return_order_count']:,}")
+        kpi3.metric("退货退款件数", f"{return_summary['return_unit_count']:,.0f}")
+        kpi4.metric("订单维度退货率", format_pct(return_summary["order_return_rate"]))
+        kpi5.metric("产品件数退货率", format_pct(return_summary["unit_return_rate"]))
+        signed_caption_prefix = "退货率分母来自当前项目销售数据中的已签收订单"
+        signed_caption_suffix = ""
+        if not return_summary.get("signed_status_available", False):
+            signed_caption_suffix = " 当前销售表未识别到订单/物流状态字段，无法严格筛出已签收，系统暂按销售表总量作为分母。"
+        st.caption(
+            f"{signed_caption_prefix}：已签收订单数 {return_summary['sales_order_count']:,.0f}，"
+            f"已签收销售件数 {return_summary['sales_unit_count']:,.0f}。"
+            f"若售后 SKU ID 能与销售明细 SKU 匹配，系统会自动缩小分母到对应 SKU。"
+            f"{signed_caption_suffix}"
+        )
+
+        display_return_df = format_return_display_df(return_filtered_df, return_summary)
+        sortable_return_fields = ["申请日期", "下单日期", "店铺", "SKU ID", "售后单状态", "申请理由", "一级原因", "退货数量", "申请退款金额", "退还给买家的金额", "订单维度 退货率", "产品件数 退货率", "退款金额", "退货退款订单数", "退货退款件数"]
+        sortable_return_fields = [c for c in sortable_return_fields if c in display_return_df.columns]
+        sort_col_a, sort_col_b, sort_col_c = st.columns([1.2, 1.0, 2.0])
+        with sort_col_a:
+            return_sort_field = st.selectbox("售后表排序字段", sortable_return_fields, index=0)
+        with sort_col_b:
+            return_sort_order = st.selectbox("售后表排序方式", ["降序", "升序"], index=0)
+        with sort_col_c:
+            st.caption("蓝色指标字段可按需拆分汇总；当前表格展示当前筛选范围内的 KPI 值，导出 Excel 会附带字段说明页。")
+
+        if not display_return_df.empty and return_sort_field:
+            sort_series = display_return_df[return_sort_field].astype(str)
+            if return_sort_field in {"申请退款金额", "退还给买家的金额", "退款金额"}:
+                sort_series = pd.to_numeric(sort_series.str.replace("MX$", "", regex=False).str.replace(",", "", regex=False), errors="coerce")
+            elif return_sort_field in {"订单维度 退货率", "产品件数 退货率"}:
+                sort_series = pd.to_numeric(sort_series.str.replace("%", "", regex=False), errors="coerce")
+            elif return_sort_field in {"退货数量", "退货退款订单数", "退货退款件数"}:
+                sort_series = pd.to_numeric(sort_series.str.replace(",", "", regex=False), errors="coerce")
+            else:
+                sort_series = sort_series.fillna("")
+            display_return_df = display_return_df.assign(_sort_key=sort_series).sort_values("_sort_key", ascending=(return_sort_order == "升序"), na_position="last").drop(columns=["_sort_key"])
+
+        st.dataframe(display_return_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            label="导出售后退货统计 Excel",
+            data=build_return_export_file(display_return_df),
+            file_name="售后退货监控_SKU退货退款统计.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 with st.expander("Goods ID 匹配检查"):
     c1, c2, c3, c4 = st.columns(4)
