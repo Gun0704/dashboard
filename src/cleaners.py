@@ -17,6 +17,15 @@ SALES_FIELD_MAP = {
     "avg_units_per_order_item": ["Avg. units per order item", "平均每个订单商品件数"],
     "avg_sales_per_order_item": ["Avg. sales per order item", "平均每个订单商品销售额"],
 }
+SALES_STATUS_KEYS = [
+    "Order status", "order status", "order_status", "订单状态", "订单状态名称",
+    "Delivery status", "delivery status", "delivery_status", "物流状态", "配送状态",
+    "Status", "status", "签收状态", "履约状态", "包裹状态",
+]
+SIGNED_STATUS_PATTERNS = [
+    "已签收", "已完成", "已送达", "已收货", "交易成功",
+    "delivered", "completed", "received", "signed", "signed for",
+]
 TRAFFIC_DATE_KEYS = ["Date", "日期"]
 TRAFFIC_ID_KEYS = ["Goods ID", "GoodsID", "商品ID", "goods id"]
 TRAFFIC_NAME_KEYS = ["Goods Name", "商品名", "商品名称"]
@@ -100,6 +109,25 @@ def _pick(raw: pd.DataFrame, keys: List[str]) -> pd.Series | None:
         return raw[col]
     return None
 
+def parse_signed_status(raw: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """Return (is_signed, status_available) for sales/order rows.
+
+    If the uploaded sales table has no recognizable status column, we keep the
+    original rows as usable denominator rows and mark status_available=False so
+    the dashboard can explain that the denominator could not be strictly filtered.
+    """
+    status_col = get_first_existing_column(raw, SALES_STATUS_KEYS)
+    if not status_col:
+        return (
+            pd.Series([True] * len(raw), index=raw.index, dtype=bool),
+            pd.Series([False] * len(raw), index=raw.index, dtype=bool),
+        )
+    status_text = raw[status_col].astype(str).str.strip().str.casefold()
+    has_status = ~status_text.isin(["", "nan", "none", "null", "<na>"])
+    pattern = "|".join(re.escape(x.casefold()) for x in SIGNED_STATUS_PATTERNS)
+    is_signed = status_text.str.contains(pattern, na=False) & has_status
+    return is_signed.fillna(False), has_status.fillna(False)
+
 def clean_sales_df(raw: pd.DataFrame, source_name: str = "") -> pd.DataFrame:
     date_col = get_first_existing_column(raw, SALES_DATE_KEYS)
     id_col = get_first_existing_column(raw, SALES_ID_KEYS)
@@ -110,6 +138,7 @@ def clean_sales_df(raw: pd.DataFrame, source_name: str = "") -> pd.DataFrame:
     df["date"] = parse_date_series(raw[date_col])
     df["goods_id"] = normalize_goods_id(raw[id_col])
     df["product_name"] = raw[name_col].astype(str).str.strip() if name_col else ""
+    df["is_signed_order"], df["status_available"] = parse_signed_status(raw)
     for target, candidates in SALES_FIELD_MAP.items():
         s = _pick(raw, candidates)
         df[target] = parse_numeric_series(s) if s is not None else 0.0
