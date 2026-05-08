@@ -58,7 +58,7 @@ def make_impressions_ctr_chart(daily: pd.DataFrame, ctr_target: float = 0.03) ->
         margin=dict(l=20, r=20, t=60, b=20),
         xaxis=dict(title="", tickformat="%m-%d", tickfont=dict(size=13)),
         yaxis=dict(title=dict(text="曝光量", font=dict(size=13)), tickfont=dict(size=12)),
-        yaxis2=dict(title=dict(text="点击率", font=dict(size=13)), overlaying="y", side="right", tickformat=".1%", tickfont=dict(size=12)),
+        yaxis2=dict(title=dict(text="点击率", font=dict(size=13)), overlaying="y", side="right", tickformat=".0%", tickfont=dict(size=12)),
         legend=dict(orientation="h", y=1.08),
         hovermode="x unified",
     )
@@ -102,7 +102,7 @@ def make_clicks_conversion_chart(daily: pd.DataFrame, conversion_target: float =
         margin=dict(l=20, r=20, t=60, b=20),
         xaxis=dict(title="", tickformat="%m-%d", tickfont=dict(size=13)),
         yaxis=dict(title=dict(text="点击量", font=dict(size=13)), tickfont=dict(size=12)),
-        yaxis2=dict(title=dict(text="转化率", font=dict(size=13)), overlaying="y", side="right", tickformat=".1%", tickfont=dict(size=12)),
+        yaxis2=dict(title=dict(text="转化率", font=dict(size=13)), overlaying="y", side="right", tickformat=".0%", tickfont=dict(size=12)),
         legend=dict(orientation="h", y=1.08),
         hovermode="x unified",
     )
