@@ -28,15 +28,30 @@ def _canonicalize_store_series(series: pd.Series) -> pd.Series:
 
 
 def build_detail_dataset(sales_df: pd.DataFrame, traffic_df: pd.DataFrame, map_df: pd.DataFrame, conversion_basis: str) -> pd.DataFrame:
-    sales_grouped = pd.DataFrame(columns=["date", "goods_id", "product_name", "store", "sales_amount", "buyers", "total_order_items", "units_ordered"]) if sales_df.empty else (
-        sales_df.groupby(["date", "goods_id", "store"], as_index=False).agg(
+    if sales_df.empty:
+        sales_grouped = pd.DataFrame(columns=[
+            "date", "goods_id", "product_name", "store", "sales_amount", "buyers", "total_order_items", "units_ordered",
+            "signed_buyers", "signed_total_order_items", "signed_units_ordered", "status_available_count",
+        ])
+    else:
+        sales_work = sales_df.copy()
+        if "is_signed_order" not in sales_work.columns:
+            sales_work["is_signed_order"] = True
+        if "status_available" not in sales_work.columns:
+            sales_work["status_available"] = False
+        for col in ["buyers", "total_order_items", "units_ordered"]:
+            sales_work[f"signed_{col}"] = sales_work[col].where(sales_work["is_signed_order"].fillna(False), 0)
+        sales_grouped = sales_work.groupby(["date", "goods_id", "store"], as_index=False).agg(
             product_name=("product_name", "first"),
             sales_amount=("sales", "sum"),
             buyers=("buyers", "sum"),
             total_order_items=("total_order_items", "sum"),
             units_ordered=("units_ordered", "sum"),
+            signed_buyers=("signed_buyers", "sum"),
+            signed_total_order_items=("signed_total_order_items", "sum"),
+            signed_units_ordered=("signed_units_ordered", "sum"),
+            status_available_count=("status_available", "sum"),
         )
-    )
     traffic_grouped = pd.DataFrame(columns=["date", "goods_id", "product_name", "store", "impressions", "clicks"]) if traffic_df.empty else (
         traffic_df.groupby(["date", "goods_id", "store"], as_index=False).agg(
             product_name=("product_name", "first"),
@@ -53,7 +68,7 @@ def build_detail_dataset(sales_df: pd.DataFrame, traffic_df: pd.DataFrame, map_d
         merged["inventory_qty"] = 0
         merged["date_created"] = pd.NaT
 
-    for col in ["sales_amount", "buyers", "total_order_items", "units_ordered", "impressions", "clicks", "inventory_qty"]:
+    for col in ["sales_amount", "buyers", "total_order_items", "units_ordered", "signed_buyers", "signed_total_order_items", "signed_units_ordered", "status_available_count", "impressions", "clicks", "inventory_qty"]:
         if col in merged.columns:
             merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
         else:
@@ -72,10 +87,19 @@ def build_detail_dataset(sales_df: pd.DataFrame, traffic_df: pd.DataFrame, map_d
 
     if conversion_basis == "订单商品数":
         merged["orders"] = merged["total_order_items"]
+        merged["signed_orders"] = merged["signed_total_order_items"]
     elif conversion_basis == "下单件数":
         merged["orders"] = merged["units_ordered"]
+        merged["signed_orders"] = merged["signed_units_ordered"]
     else:
         merged["orders"] = merged["buyers"]
+        merged["signed_orders"] = merged["signed_buyers"]
+    # When no status column exists in the sales upload, signed_* equals original totals
+    # to keep the dashboard usable while marking the denominator as an unfiltered fallback.
+    no_status_mask = merged["status_available_count"].fillna(0) <= 0
+    merged.loc[no_status_mask, "signed_orders"] = merged.loc[no_status_mask, "orders"]
+    merged.loc[no_status_mask, "signed_units_ordered"] = merged.loc[no_status_mask, "units_ordered"]
+    merged["has_signed_status_filter"] = ~no_status_mask
 
     merged["sku"] = merged.get("sku", "").fillna("").astype(str).str.strip()
     merged["display_sku"] = merged["sku"].mask(merged["sku"].isin(["", "nan", "None"]), merged["goods_id"].astype(str))
